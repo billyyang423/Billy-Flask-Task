@@ -1,0 +1,81 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: -=app_name=-
+  name: -=app_name=-
+  namespace: -=kubernetes_namespace=-
+spec:
+  replicas: -=replicas=-
+  selector:
+    matchLabels:
+      app: -=app_name=-
+  minReadySeconds: -=min_ready_seconds=-
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: -=max_unavailable=-
+      maxSurge: -=max_surge=-
+  template:
+    metadata:
+      labels:
+        app: -=app_name=-
+    spec:
+      containers:
+      - name: -=app_name=-
+        image: -=docker_org=-/-=app_name=-:-=docker_tag=-
+        ports:
+        - containerPort: -=container_port=-
+          protocol: TCP
+        livenessProbe:
+          tcpSocket:
+            port: -=container_port=-
+          initialDelaySeconds: -=initial_delay_seconds=-
+          periodSeconds: -=period_seconds=-
+        readinessProbe:
+          tcpSocket:
+            port: -=container_port=-
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: -=kubernetes_namespace=-
+  name: -=app_name=-
+spec:
+  selector:
+    app: -=app_name=-
+  ports:
+    - protocol: TCP
+      port: -=service_port=-
+      targetPort: -=container_port=-
+  type: ClusterIP
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-staging"
+    kubernetes.io/tls-acme: "true"
+  name: -=app_name=-
+  namespace: -=kubernetes_namespace=-
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: -=domain_name=-
+    http:
+      paths:
+      - pathType: Prefix
+        path: -=path=-
+        backend:
+          service:
+            name: -=app_name=-
+            port:
+              number: -=service_port=-
+  tls:
+  - hosts:
+    - -=domain_name=-
+    secretName: -=app_name=--tls
+

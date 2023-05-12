@@ -1,0 +1,164 @@
+name: "K8S - billy-Flask-App CI/CD"
+
+on:
+  push:
+    branches:
+      - 'main'
+
+jobs:
+  build_and_deploy:
+    name: "K8S - billy-Flask-App CI/CD"
+    runs-on: ${{ matrix.os }}
+    env:
+      app_name: "billy-flask-app"
+      kubernetes_namespace: "billy-flask-app"
+      container_port: "5000"
+      service_port: "80"
+      domain_name: "billy.idevops.io"
+      zone_id: "Z370FY5A2PDAE"
+      k8s_cluster_name: "idevops-vaas-cluster"
+      aws_region: "us-west-2"
+      replicas: 1
+      replicas_mysql: 1
+      max_surge: 1
+      max_unavailable: 1
+      min_ready_seconds: 5
+      initial_delay_seconds: 25
+      period_seconds: 20
+      docker_org: "billyyang423"
+      docker_image: "billy-flask-app"
+      docker_tag: "${{ github.run_number }}"
+      path: "/"
+
+    strategy:
+      matrix:
+        os: [ 'idevops-runner' ]
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: actions/setup-python@v2
+        with:
+          python-version: '3.7'
+          architecture: 'x64'
+
+      - uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+        id: install
+
+      - uses: unfor19/install-aws-cli-action@v1.0.4
+        with:
+          version: 2
+        id: install-aws-cli
+
+      - name: "Use AWS CLI to pull K8S Kubeconfig"
+        uses: iDevOps-io/idevops-git-actions/aws_pull_eks_kubeconfig@main
+        with:
+          AWS_ACCESS_KEY_ID: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          AWS_SECRET_ACCESS_KEY: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          AWS_DEFAULT_REGION: "${{ env.aws_region }}"
+          kubernetes_cluster_name: "${{ env.k8s_cluster_name }}"
+
+      - name: EXECUTE:UNIT:TEST
+        run: |
+          sudo apt-get -q update && sudo apt-get install -qy python3-dev
+          pip install -r requirements.txt && cd app/
+          python test_app.py
+
+      - name: "DOCKER:BUILD:CHECK:PUSH"
+        uses: iDevOps-io/idevops-git-actions/docker_build_check_tag_and_push@main
+        with:
+          docker_username: "${{ secrets.DOCKER_USERNAME }}"
+          docker_password: "${{ secrets.DOCKER_PASSWORD }}"
+          docker_org: "${{ env.docker_org }}"
+          docker_image: "${{ env.docker_image }}"
+          docker_tag: "${{ env.docker_tag }}"
+          docker_file_location: "./"
+
+      - name: "DOCKER:IMAGE:SCAN:ANCHORE"
+        uses: anchore/scan-action@v3
+        with:
+          image: "${{ env.docker_org }}/${{ env.docker_image }}:${{ env.docker_tag }}"
+          fail-build: false
+
+      - name: "EXECUTE:TEMPLATE:REPLACEMENT:ON:FILE"
+        uses: iDevOps-io/idevops-git-actions/template_replace_file@main
+        with:
+          input_file: "./billy-flask-app-deploy.yaml.template"
+          output_file: "./kubernetes_manifest.yaml"
+
+      - name: "CREATE:NAMESPACE:&:DOCKER:PULL:SECRET"
+        uses: iDevOps-io/idevops-git-actions/kubernetes_create_docker_pull_secret_and_namespace@main
+        with:
+          aws_access_key_id: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws_access_secret_key: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws_region: "${{ env.aws_region }}"
+          docker_username: ${{ secrets.DOCKER_USERNAME }}
+          docker_password: ${{ secrets.DOCKER_PASSWORD }}
+          namespace: "${{ env.kubernetes_namespace }}"
+          docker_host_url: "https://index.docker.io/v1/"
+          docker_pull_secret: "${{ env.app_name }}"
+
+      - name: "APPLY:KUBERNETES:MANIFEST:FILE"
+        uses: iDevOps-io/idevops-git-actions/kubernetes_apply_manifest_file@main
+        with:
+          aws_access_key_id: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws_access_secret_key: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws_region: "${{ env.aws_region }}"
+          manifest: "./kubernetes_manifest.yaml"
+          namespace: "${{ env.kubernetes_namespace }}"
+          kube_config_location: "$HOME/.kube/config"
+
+      - name: "KUBERNETES:VALIDATE:DEPLOYMENT"
+        uses: iDevOps-io/idevops-git-actions/kubernetes_validate_deployment_rollout@main
+        with:
+          aws_access_key_id: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws_access_secret_key: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws_region: "${{ env.aws_region }}"
+          app_name: "${{ env.app_name }}"
+          namespace: "${{ env.kubernetes_namespace }}"
+          kubernetes_cluster_name: "${{ env.k8s_cluster_name }}"
+
+      - name: "CREATE:INGRESS:URL"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          echo "ingress_url=$(kubectl -n ${{ env.kubernetes_namespace }} get ingress | grep ${{ env.kubernetes_namespace }} | awk '{ print $4 }')" >> ${GITHUB_ENV}
+
+      - name: "CREATE:A:CNAME:RECORD:SET"
+        uses: iDevOps-io/idevops-git-actions/aws_create_route53_entry@main
+        with:
+          aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws_route53_hosted_zone_id: "${{ env.zone_id }}"
+          aws_route53_rr_action: "UPSERT"
+          aws_route53_rr_name: "${{ env.domain_name }}"
+          aws_route53_rr_type: "CNAME"
+          aws_route53_rr_ttl: "60"
+          aws_route53_rr_value: "${{ env.ingress_url }}"
+
+      - name: "CURL:FOR:301:RESPONSE"
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          #!/bin/bash
+          COUNTER=0
+          while [ $COUNTER -lt 80 ];
+          do
+            if [ "$(curl -s -o /dev/null -w "%{http_code}" ${{ env.domain_name }})" != "301" ] ; then
+              true $((COUNTER=COUNTER+1))
+              echo "EXTERNAL-IP status code $COUNTER: "$(curl -s -o /dev/null -w "%{http_code}" ${{ env.domain_name }})""
+              sleep 2
+            else
+              echo "${{ env.domain_name }} status code: "$(curl -s -o /dev/null -w "%{http_code}" ${{ env.domain_name }})""
+              break
+            fi
+          done
+
+      - name: "ZA:PROXY:SCAN"
+        uses: iDevOps-io/idevops-git-actions/execute_zaproxy_owasp_security_can_on_endpoint@main
+        with: 
+          web_url: http://${{ env.domain_name }}
